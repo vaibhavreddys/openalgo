@@ -1,0 +1,6 @@
+.env
+auto_login.log
+auto_login_cron.log
+auto_login_health.log
+__pycache__/
+*.pyc
