@@ -12,10 +12,12 @@ classes, and singleton accessors directly instead of making HTTP calls back into
 the same OpenAlgo process. The document does not replace request schemas in
 [`docs/api`](../api/README.md) when a service also has a public endpoint.
 
-The current service layer contains 71 Python modules under `services/`. Some
-services back REST endpoints, while others run internal workflows, schedulers,
-streaming, analytics, alerts, or risk management. Do not assume that every
-service:
+The current tree contains 80 direct `services/*.py` modules and 103 Python
+modules recursively under `services/`. The direct count is the inventory used
+by this page; subpackages such as `services/strategy_module/` have their own
+reference. Some services back REST endpoints, while others run internal
+workflows, schedulers, streaming, analytics, alerts, or risk management. Do not
+assume that every service:
 
 - has a public REST endpoint;
 - accepts the same arguments as the OpenAlgo SDK;
@@ -41,7 +43,21 @@ Related references:
 - [EventBus design](../design/53-event-bus/README.md)
 - [Order constants](order-constants.md)
 - [Symbol format](symbol-format.md)
+- [Strategy module and RMS](strategy_rms_documentation.md)
 - [Flow import format](flow-import-format.md)
+
+The strategy subpackage is intentionally documented separately. This page
+defines the account-service boundary it reuses; do not copy its engine, state,
+recovery or risk contracts here. Its broker-backed book views call the existing
+authenticated orderbook, tradebook and positionbook services with internal
+credentials: `services/strategy_module/views.py` exposes `strategy_orderbook`,
+`strategy_tradebook` and `strategy_positions`, which reuse
+`get_orderbook_with_auth`, `get_tradebook_with_auth` and
+`get_positionbook_with_auth` for live runs (and the matching sandbox book
+services for sandbox runs). The run's own mode selects live versus sandbox; the platform-wide
+analyzer toggle cannot divert a live strategy, and sandbox never reads the real
+account. Broker rows are narrowed by durable strategy order ids/contracts and
+the browser labels recorded order rows as local audit rather than broker truth.
 
 ## Architecture
 
@@ -450,20 +466,26 @@ get_flow_client(api_key)
 get_flow_price_monitor()
 FlowPriceMonitor.add_alert(workflow_id, symbol, exchange, condition,
                            target_price, price_lower=None, price_upper=None,
-                           percentage=None, api_key=None)
+                           percentage=None, api_key=None, trigger="once",
+                           expiration="none")
 FlowPriceMonitor.remove_alert(workflow_id)
 FlowPriceMonitor.get_alert(workflow_id)
 FlowPriceMonitor.get_status()
 FlowPriceMonitor.shutdown()
+restore_price_alerts()          # re-arm active priceAlert workflows at startup
 
 init_flow_scheduler(db_url=None, api_key=None)
 get_flow_scheduler()
-execute_workflow_scheduled(workflow_id, api_key=None)
+execute_workflow_scheduled(workflow_id, api_key=None, market_hours_only=False)
+# api_key is only for jobs pickled by an older build; the current key is read
+# from the workflow row on every run, and is never stored in the jobstore.
 FlowScheduler.add_workflow_job(workflow_id, schedule_type, time_str="09:15",
                                days=None, execute_at=None,
                                interval_value=None, interval_unit=None,
-                               func=None)
-FlowScheduler.remove_workflow_job(workflow_id)
+                               func=None, market_hours_only=False)
+FlowScheduler.remove_workflow_job(workflow_id, strict=False)
+# strict=True raises on a jobstore failure instead of returning False, so a
+# caller cannot mark a workflow inactive while its job is still armed.
 FlowScheduler.pause_job(job_id)
 FlowScheduler.resume_job(job_id)
 FlowScheduler.shutdown()
@@ -480,7 +502,7 @@ Data:   get_quotes, get_multi_quotes, get_depth, get_history, get_order_status,
         orderbook, tradebook, positionbook, holdings, funds, get_open_position
 Lookup: symbol, search_symbols, get_expiry, get_intervals, optionchain,
         optionsymbol, syntheticfuture, get_option_greeks
-Other:  holidays, timings, margin, telegram
+Other:  holidays, timings, margin, telegram, whatsapp
 ```
 
 Node execution belongs in `NodeExecutor` and `execute_node_chain(...)`. New Flow

@@ -49,3 +49,6 @@ git push --force-with-lease
 | Name | GitHub | Interested in |
 | --- | --- | --- |
 | Rajandran R | [@marketcalls](https://github.com/marketcalls) | maintainer |
+|Padma Balaji L| [@PadmaBalajiL](https://github.com/PadmaBalajiL)|python|
+|Niranjan | [@cracker314](https://github.com/cracker314)|python|
+| Navadeep Marella | [@NavadeepDj](https://github.com/NavadeepDj) | python, backtesting |

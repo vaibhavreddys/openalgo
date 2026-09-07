@@ -725,7 +725,15 @@ check_status "Failed to create base directory"
 
 # Clone repository
 log_message "\nCloning OpenAlgo repository..." "$BLUE"
-sudo git clone https://github.com/marketcalls/openalgo.git $OPENALGO_PATH
+# --filter=blob:none makes this a partial clone: the server sends every
+# commit and tree but no file contents, so it pulls ~20 MB instead of
+# ~280 MB. Blobs outside the current checkout are fetched on demand, so
+# the full history stays usable -- all 4,824 commits, 62 tags, every
+# branch -- which keeps `git reset --hard HEAD~n`, tag checkouts and
+# branch switching working. Nearly all of that 280 MB is superseded
+# frontend/dist bundles that a server never reads. A host without filter
+# support just full-clones, so this is never worse than no flag at all.
+sudo git clone --filter=blob:none https://github.com/marketcalls/openalgo.git $OPENALGO_PATH
 check_status "Failed to clone OpenAlgo repository"
 
 # Create virtual environment using uv
@@ -850,6 +858,13 @@ server {
     listen [::]:80;
     server_name $DOMAIN;
     root /var/www/html;
+
+    # OPENALGO_WEBHOOK_LOG_GUARD: URL credentials never enter nginx access logs.
+    set \$openalgo_loggable 1;
+    if (\$uri ~ ^/(strategy|flow|chartink)/webhook/) {
+        set \$openalgo_loggable 0;
+    }
+    access_log /var/log/nginx/${DOMAIN}_access.log combined if=\$openalgo_loggable;
     
     location / {
         try_files \$uri \$uri/ =404;
@@ -967,6 +982,13 @@ server {
     listen [::]:80;
     server_name $DOMAIN;
 
+    # OPENALGO_WEBHOOK_LOG_GUARD: suppress URL-secret routes before redirect logs.
+    set \$openalgo_loggable 1;
+    if (\$uri ~ ^/(strategy|flow|chartink)/webhook/) {
+        set \$openalgo_loggable 0;
+    }
+    access_log /var/log/nginx/${DOMAIN}_access.log combined if=\$openalgo_loggable;
+
     # WebSocket path exceptions to avoid 301 redirect loop
     location = /ws {
         return 301 https://\$host\$request_uri;
@@ -987,6 +1009,13 @@ server {
     listen [::]:443 ssl;
     
     server_name $DOMAIN;
+
+    # OPENALGO_WEBHOOK_LOG_GUARD: URL credentials never enter nginx access logs.
+    set \$openalgo_loggable 1;
+    if (\$uri ~ ^/(strategy|flow|chartink)/webhook/) {
+        set \$openalgo_loggable 0;
+    }
+    access_log /var/log/nginx/${DOMAIN}_access.log combined if=\$openalgo_loggable;
     
     ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
@@ -1095,8 +1124,12 @@ server {
         proxy_buffers 4 256k;
         proxy_busy_buffers_size 256k;
 
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
+        # Plain HTTP only: /ws, /ws/ and /socket.io/ have their own blocks.
+        # Forcing "Connection: upgrade" here sent every ordinary request
+        # upstream with a bogus upgrade header and an empty Upgrade:, which
+        # breaks HTTP/1.1 keep-alive to gunicorn and shows up as intermittent
+        # truncated asset responses and 5xx (GitHub issue #1807).
+        proxy_set_header Connection "";
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
