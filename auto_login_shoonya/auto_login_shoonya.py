@@ -265,34 +265,32 @@ def shoonya_oauth_code(
     password: str,
     totp_secret: str,
     timeout_seconds: float = 60.0,
-    redirect_host: str = "",  # kept for back-compat; no longer used
+    redirect_host: str = "",
 ) -> str | None:
     """Run the OAuth login page headlessly; return the authorization code.
 
-    Shoonya's hosted OAuth login page is a Vue SPA. Submitting the form no
-    longer redirects to the app callback — instead it performs two XHRs
-    in-page (QuickAuth, then GetAuthCode) and returns both the susertoken
-    and the OAuth ``code`` in the JSON responses. The previous version of
-    this script waited for a page navigation that never arrives, so it
-    always timed out at 150 s.
+    Shoonya's hosted OAuth login page is a Vue SPA: the form submit fires
+    two in-page XHRs (QuickAuth, then GetAuthCode). GetAuthCode answers
+    302 with a ``Location`` pointing at the app's registered OAuth callback
+    (``https://<host>/shoonya/callback?code=...``), and the browser then
+    navigates there. Reading XHR response bodies via Playwright is not
+    reliable (the QuickAuth body is frequently unreadable), so this works
+    at the request level instead:
 
-    Fix: install a Playwright ``response`` listener that captures both JSON
-    bodies, then wait until either:
-      * both responses have arrived (QuickAuth ``stat=Ok`` + GetAuthCode
-        ``stat=Ok`` with a ``code``) — success, return the code; or
-      * a QuickAuth response came back ``stat=Not_Ok`` — fail fast with
-        Shoonya's own ``emsg`` (bad password / TOTP / user blocked).
+      * a ``request`` listener records the callback URL — the single-use
+        ``code`` is in its query string — the moment the browser asks for
+        it; and
+      * the callback request is ABORTED via routing. The headless browser
+        has no OpenAlgo web session, so the callback would bounce to the
+        login page and waste the single-use code; aborting keeps the code
+        ours to exchange via GenAcsTok.
 
-    The ``appkey`` field of the QuickAuth payload is computed inside the
-    SPA from a Finvasia-issued obfuscation table we cannot derive
-    client-side; driving the real form is the simplest way to obtain it.
-    Filling the three inputs and clicking LOGIN is a no-op for the SPA's
-    own logic — it always issues the same two XHRs — so we don't have to
-    worry about the button being disabled or the click being swallowed.
+    The QuickAuth verdict is read from the page state when possible and
+    otherwise inferred from navigation: if the browser heads for the
+    callback URL, the credentials were accepted.
 
-    Returns the OAuth ``code`` string. Returns ``None`` when the flow
-    succeeded but we couldn't observe the GetAuthCode body (defensive —
-    shouldn't happen in practice).
+    Raises RuntimeError (retryable) when the flow stalls or the gateway
+    5xxes; the caller classifies credential errors as fatal.
     """
     try:
         from playwright.sync_api import sync_playwright
@@ -305,54 +303,28 @@ def shoonya_oauth_code(
     totp = pyotp.TOTP(totp_secret)
     check_totp_clock(totp)
 
-    captured: dict[str, dict[str, Any]] = {}
+    captured: dict[str, Any] = {}
+
+    def _on_request(request: Any) -> None:
+        url = getattr(request, "url", "") or ""
+        if "/callback" in url and "code=" in url and "code" not in captured:
+            captured["code"] = url
+        if "/NorenWClientAPI/QuickAuth" in url and "qa" not in captured:
+            # Headers of XHR *requests* are readable even when response
+            # bodies are not; the response listener below adds the verdict.
+            captured["qa"] = {"at": time.time()}
 
     def _on_response(response: Any) -> None:
         try:
-            url = response.url
+            url = getattr(response, "url", "") or ""
         except Exception:
             return
-        if "/NorenWClientAPI/QuickAuth" in url and "qa" not in captured:
-            try:
-                captured["qa"] = response.json()
-            except Exception:
-                try:
-                    captured["qa"] = {"_raw": response.text()[:400]}
-                except Exception:
-                    captured["qa"] = {}
-        elif "/NorenWClientAPI/GetAuthCode" in url and "gac" not in captured:
-            # Keep status + headers + body. Shoonya returns 302 with a
-            # Location header pointing at the OAuth callback (which may or
-            # may not carry ?code=...); the SPA follows it and the
-            # callback consumes the single-use code. We capture the
-            # Location ourselves before Playwright follows it so we can
-            # exchange the code via GenAcsTok ourselves.
-            entry: dict[str, Any] = {
-                "status": getattr(response, "status", None),
-            }
-            try:
-                # response.headers is a dict-like in sync_playwright;
-                # header names are lower-case.
-                hdrs = {}
-                src = response.headers or {}
-                if hasattr(src, "items"):
-                    hdrs = {str(k).lower(): str(v) for k, v in src.items()}
-                else:
-                    try:
-                        hdrs = {str(k).lower(): str(v) for k, v in dict(src).items()}
-                    except Exception:
-                        hdrs = {}
-                entry["headers"] = hdrs
-            except Exception:
-                entry["headers"] = {}
-            try:
-                entry["json"] = response.json()
-            except Exception:
-                try:
-                    entry["raw"] = response.text()[:600]
-                except Exception:
-                    entry["raw"] = "<unreadable>"
-            captured["gac"] = entry
+        if "/NorenWClientAPI/QuickAuth" in url and response.status >= 500:
+            # Gateway 5xx (the 06:00 IST blip) — retryable by the caller.
+            raise RuntimeError(
+                f"Shoonya QuickAuth gateway error HTTP {response.status} — "
+                "transient; retrying"
+            )
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -360,7 +332,19 @@ def shoonya_oauth_code(
         )
         try:
             page = browser.new_page()
+            page.on("request", _on_request)
             page.on("response", _on_response)
+            # Abort the OAuth callback navigation: without a web session it
+            # can only waste the single-use code. (It also keeps the final
+            # page on Shoonya's domain, which makes error text readable.)
+            callback_host = redirect_host or urlsplit(_read_env_value(
+                Path(__file__).resolve().parents[2] / ".env", "HOST_SERVER") or ""
+            ).netloc
+            if callback_host:
+                page.route(
+                    f"https://{callback_host}/*callback*",
+                    lambda route: route.abort(),
+                )
 
             login_url = f"{SHOONYA_OAUTH_LOGIN_URL}?api_key={client_id}&route_to={user_id}"
             log.info("Opening Shoonya OAuth login page for %s ...", user_id)
@@ -373,115 +357,33 @@ def shoonya_oauth_code(
             page.fill("#lgnotp", totp.now())
             page.click("button:has-text('LOGIN')")
 
-            # Wait until we have at least the QuickAuth response — that
-            # tells us whether the credentials were accepted. Then, if it
-            # was OK, wait up to the rest of the budget for GetAuthCode.
-            qa_deadline_ms = int(timeout_seconds * 1000)
-
-            # Spin briefly until QuickAuth lands. The listener runs on the
-            # same thread as our reads here (Playwright sync API), so the
-            # `captured` dict is safe to poll without locks.
-            qa_waited_ms = 0
-            while "qa" not in captured and qa_waited_ms < qa_deadline_ms:
+            deadline_ms = int(timeout_seconds * 1000)
+            waited_ms = 0
+            while "code" not in captured and waited_ms < deadline_ms:
                 page.wait_for_timeout(500)
-                qa_waited_ms += 500
+                waited_ms += 500
 
-            if "qa" not in captured:
-                body_snippet = ""
-                try:
-                    body_snippet = page.inner_text("body")[:400].replace("\n", " ")
-                except Exception:
-                    pass
-                raise RuntimeError(
-                    f"QuickAuth response did not arrive within "
-                    f"{timeout_seconds:.0f}s (page URL: {page.url}). "
-                    f"Page said: {body_snippet or '(empty)'}"
-                )
-
-            qa = captured["qa"]
-            qa_stat = qa.get("stat")
-            if qa_stat != "Ok":
-                # Surface Shoonya's own error message (bad password, TOTP
-                # rejection, user blocked, ...) instead of a generic
-                # timeout. _post_jdata() in shoonya_quick_auth() does the
-                # same when we go direct.
-                msg = qa.get("emsg") or qa.get("_raw") or "Unknown QuickAuth error"
-                raise RuntimeError(f"Shoonya QuickAuth rejected: {msg}")
-
-            susertoken = qa.get("susertoken") or ""
-            if not susertoken:
-                raise RuntimeError(
-                    "Shoonya QuickAuth returned Ok but no susertoken: "
-                    f"{str(qa)[:300]}"
-                )
-            log.info(
-                "QuickAuth returned susertoken (length=%d); waiting for GetAuthCode...",
-                len(susertoken),
-            )
-
-            # GetAuthCode typically lands within a second of QuickAuth; give
-            # it the remaining time budget.
-            gac_remaining_ms = max(5_000, qa_deadline_ms - qa_waited_ms)
-            gac_waited_ms = 0
-            while "gac" not in captured and gac_waited_ms < gac_remaining_ms:
-                page.wait_for_timeout(500)
-                gac_waited_ms += 500
-
-            if "gac" not in captured:
-                raise RuntimeError(
-                    "QuickAuth succeeded but GetAuthCode response did not "
-                    f"arrive within {gac_remaining_ms / 1000:.0f}s"
-                )
-
-            gac_entry = captured["gac"]
-            gac_json = gac_entry.get("json") if isinstance(gac_entry, dict) and "json" in gac_entry else None
-            if not isinstance(gac_json, dict):
-                gac_json = {}
-
-            status = gac_entry.get("status")
-            # Happy path 1: JSON response with stat=Ok + code.
-            if gac_json.get("stat") == "Ok" and gac_json.get("code"):
-                code = str(gac_json["code"])
+            if "code" in captured:
+                query = parse_qs(urlsplit(captured["code"]).query)
+                code = (query.get("code") or [""])[0]
+                if not code:
+                    raise RuntimeError(
+                        f"Callback URL carried no code parameter: {captured['code']}"
+                    )
                 log.info("Captured OAuth authorization code (length=%d)", len(code))
                 return code
 
-            # Happy path 2: 302 redirect to the OAuth callback. The Location
-            # header normally carries ?code=..., but Playwright strips it
-            # when the browser auto-follows. We can still try headers, then
-            # fall back to the DB-written token via the caller (return None).
-            if status and 300 <= status < 400:
-                location = (gac_entry.get("headers") or {}).get("location") or (
-                    gac_entry.get("headers") or {}
-                ).get("Location")
-                if location:
-                    query = parse_qs(urlsplit(location).query)
-                    if (query.get("code") or [""])[0]:
-                        code = query["code"][0]
-                        log.info(
-                            "Captured OAuth authorization code from redirect "
-                            "Location header (length=%d)",
-                            len(code),
-                        )
-                        return code
-                log.info(
-                    "GetAuthCode returned %s — Shoonya redirected to the "
-                    "OAuth callback, so the single-use code has been consumed "
-                    "by the app's callback. Falling back to the token that "
-                    "OpenAlgo's own callback wrote into its DB.",
-                    status,
-                )
-                return None
-
-            # Error path.
-            msg = (
-                gac_json.get("emsg")
-                or gac_entry.get("raw")
-                or f"status={status!r}"
-                or "Unknown GetAuthCode error"
-            )
+            # No callback navigation: read the page's own error text (the
+            # SPA renders QuickAuth's emsg for bad password / TOTP / block).
+            body_snippet = ""
+            try:
+                body_snippet = page.inner_text("body")[:400].replace("\n", " ")
+            except Exception:
+                pass
             raise RuntimeError(
-                f"Shoonya GetAuthCode failed: {msg} "
-                f"(response={str(gac_entry)[:300]})"
+                f"OAuth login did not reach the callback within "
+                f"{timeout_seconds:.0f}s (last URL: {page.url}). "
+                f"Page said: {body_snippet or '(empty)'}"
             )
         finally:
             browser.close()
@@ -1105,7 +1007,8 @@ def main() -> int:
                 or "invalid session key" in msg
                 or "quickauth rejected" in msg
                 or "getauthcode failed" in msg
-            ):
+                or "password is empty" in msg
+            ) and "gateway error" not in msg and "502" not in msg and "did not reach the callback" not in msg:
                 # Auth-class errors don't benefit from retry
                 log.error("Authentication failure (not retrying): %s", exc)
                 notify(
